@@ -1,0 +1,513 @@
+---
+title: "SimulatedData"
+output: html_document
+date: "2025-02-21"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r Setting Parameter Values}
+#set.seed(2105098)
+#
+#x_0 = rep(0,n_var_params)
+#Defining Dimensions
+U_dim = 4
+Z_dim = 2
+num_teams = 4
+n_gw=20
+n_gw_train = n_gw*38/40
+num_games <- (num_teams/2)*n_gw
+size_alpha_betas = 1 + Z_dim*(U_dim^2)
+size_phis = Z_dim * U_dim * (U_dim - 1)
+size_deltas = Z_dim * U_dim
+#Defining Indices
+m_betas_ind = size_alpha_betas
+sigma_betas_ind = 2*size_alpha_betas
+m_phis_ind = sigma_betas_ind + size_phis
+sigma_phis_ind = m_phis_ind + size_phis
+m_omega_all_ind = sigma_phis_ind + (U_dim - 1) * num_teams
+sigma_omega_all_ind = m_omega_all_ind + (U_dim/2) * num_teams
+rho_ind = sigma_omega_all_ind + (U_dim/2) * num_teams
+omegas_all_ind = rho_ind + (U_dim - 1) * num_teams * n_gw
+#
+n_var_params = 2*(1+2*(U_dim^2)+2*U_dim*(U_dim-1))+2*U_dim+num_teams*((U_dim-1)+(U_dim/2)+(U_dim/2)+(U_dim-1)*n_gw)
+
+#Clip Function:
+clip <- function(x, lower, upper) {
+  pmax(lower, pmin(x, upper))
+}
+
+#Defining Parameters:
+
+#Phis mean
+x_0[(sigma_betas_ind+1):m_phis_ind] = rnorm(size_phis,0.2,sd=0.05)
+phis_m <- array(x_0[(sigma_betas_ind+1):m_phis_ind],dim=c((U_dim - 1),U_dim,2))
+phis_m <- array(rep(-1,((U_dim-1)*U_dim*2)),dim=c((U_dim - 1),U_dim,2))
+phis_m <- aperm(phis_m, c(2, 1, 3))
+
+#Omegas
+#Advanced Omega Simulation:
+omegas <- array(rep(0,(omegas_all_ind-(rho_ind+1))),dim=c(n_gw,(U_dim-1),num_teams))
+omegas <- aperm(omegas, c(2, 1, 3))
+for(i in 1:num_teams){
+  abilities <- runif((U_dim/2),-2,-0.3)
+  home_influence <- rnorm(((U_dim/2)-1),mean=0,sd=0.05)
+  omegas[1:(U_dim/2),1,i] <- abilities
+  omegas[((U_dim/2)+1):(U_dim - 1),1,i] <- (abilities[1:((U_dim/2)-1)] + home_influence)
+  #abilities <- runif((U_dim-1),-0.6,0.4)
+  #omegas[1:(U_dim-1),1,i] <- abilities
+  for(w in 1:(U_dim/2)){
+    w_ab <- abilities[w]
+    gw_abs <- runif(1,-0.01,0.01)
+    for(j in 2:n_gw){
+      omegas[w,j,i] <- omegas[w,(j-1),i]+gw_abs
+    }
+  }
+  for(o in ((U_dim/2)+1):(U_dim - 1)){
+    w_ab <- abilities[(o-(U_dim/2))] + home_influence[(o-(U_dim/2))]
+    for(j in 1:n_gw){
+      omegas[o,j,i] <- omegas[(o-(U_dim/2)),j,i]+ home_influence[(o-(U_dim/2))]
+    }
+  }  
+}
+omegas_augment <- aperm(omegas, c(2, 1, 3))
+x_0[(rho_ind+1):omegas_all_ind] = c(omegas_augment)
+
+```
+
+```{r Density Function}
+DPP_PMF <- function(Deltas,gw_Gammas,Betas,times_q,marks_q,a,teams_q,U_dim,z_pred,zones_q,hteam,ateam){
+  num_iter <- length(marks_q) #Number of times before t
+  num_sum <- rep(0,U_dim)
+  den_sum <- rep(0,U_dim)
+  alphas <- rep(a,U_dim)
+  t_pred <- sample(c(hteam,ateam),1)
+  team <- teams_q[length(teams_q)]
+  #next_team <- sample(c(hteam,ateam),1)
+  for(q in 1:num_iter){
+    z_q <- as.numeric(zones_q[q])
+    u_q <- as.numeric(marks_q[q])
+    if(team==0 | z_q==0 | u_q==0){
+      print(team)
+      print(z_q)
+      print(u_q)
+    }
+    gamma_first <- c(gw_Gammas[u_q,c(1:(dim(gw_Gammas)[2]/2)),z_pred,ateam]) #Gamma vector
+    gamma_second <- c(gw_Gammas[u_q,c(((dim(gw_Gammas)[2]/2)+1):(dim(gw_Gammas)[2])),z_pred,hteam])
+    gamma_q <- c(gamma_first,gamma_second)
+    
+    #gamma_q <- c(gw_Gammas[u_q,,z_pred,t_pred])
+    beta_q <- c(Betas[u_q,,z_pred]) #Betas vector
+    t_ij <- times_q[(num_iter+1)]-times_q[q]
+    decay <- c(exp((-1)*beta_q*t_ij))
+    num_sum <- num_sum + gamma_q*decay
+    den_sum <- den_sum + decay
+  }
+  #PMF:
+  numerator <- c(Deltas[z_pred,]) + a*num_sum
+  #denominator <- 1 + a*sum(den_sum)
+  denominator <- sum(numerator)
+  pmf <- numerator/denominator
+  return(pmf)
+}
+
+```
+
+```{r Calculating Parameters - Functions}
+#We have sampled the Variational Parameter Coefficients. We now need to use these to sample the actual parameters of the model:
+#### GAMMA ####
+omega_calc <- function(m_omegas,sd_omegas,rho_omegas){
+  om_matrix <- array(rep(0,(U_dim-1)*num_teams*n_gw),dim=c(n_gw,(U_dim-1),num_teams))
+  om_matrix[1,,] <- m_omegas
+  for(i in 2:n_gw){
+    rho_num <- 1-(rho_omegas^i) #Expectation Numerator
+    rho_den <- 1-rho_omegas #Expectation Denominator
+    rho_frac <- rho_num/rho_den #Fraction
+    rho_frac_ex <- cbind(rho_frac,rho_frac)[,-(U_dim)]
+    gw_matrix <- m_omegas*rho_frac_ex #Matrix of omegas for gameweek
+    om_matrix[i,,] <- gw_matrix #Adding to list of matrices
+  }
+  return(om_matrix)
+}
+
+gamma_calc <- function(phis,omegas){
+  gammas <- array(rep(0,U_dim*U_dim*Z_dim*num_teams*dim(omegas)[2]),dim=c(U_dim,U_dim,Z_dim,num_teams,dim(omegas)[2])) 
+  for(w in 1:dim(omegas)[2]){
+    for(t in 1:num_teams){
+      omegas_t_gw <- omegas[,w,t]
+      for(z in 1:Z_dim){
+        phi_z <- phis[,,z]
+        phi_om_sums <- sweep(phi_z,2,omegas_t_gw,"+") #Calculates Sums
+        exp_sums <- exp(phi_om_sums) #Exponential
+        row_sums <- rowSums(exp_sums)
+        gamma_U <- 1/(1+row_sums)
+        gammas[,U_dim,z,t,w] <- gamma_U
+        rest_gammas <- sweep(exp_sums,1,gamma_U,"*")
+        gammas[,1:(U_dim-1),z,t,w] <- rest_gammas
+      }
+    }
+  }
+  return(gammas)
+}
+#### BETA ####
+beta_calc <- function(betas_m, betas_sd){
+  beta_matrix <- array(rep(0,U_dim*U_dim*Z_dim),dim=c(U_dim,U_dim,Z_dim))
+  for(z in 1:Z_dim){
+    zb_m <- betas_m[,,z]
+    zb_sd <- betas_sd[,,z]
+    expectation <- exp(zb_m+((zb_sd^2)/2))
+    beta_matrix[,,z] <- expectation
+  }
+  return(beta_matrix)
+}
+#### DELTA ####
+delta_calc <- function(alphas){
+  deltas <- matrix(rep(0,(2*U_dim)),nrow = U_dim,ncol=Z_dim)
+  for(z in 1:Z_dim){
+    a_vec <- alphas[,z]
+    a_vec_sum <- sum(a_vec)
+    d <- a_vec/a_vec_sum
+    deltas[,z] <- d
+  }
+  return(deltas)
+}
+
+delta_sim <- function(n,z){
+  d <- clip(rcauchy((U_dim),location=20,scale=2.5), 1e-1, 10000)
+  d_data <- c(d,d)
+  d <- matrix(d_data,nrow = z,ncol=U_dim)
+  d[1,] <- d[1,]/sum(d[1,])
+  d[2,] <- d[2,]/sum(d[2,])
+  print(max(d))
+  return(d)
+}
+#### ALPHA ####
+alpha_calc <- function(m,sd){
+  alpha <- exp(m + ((sd^2)/2))
+  return(alpha)
+}
+
+
+```
+
+```{r Calculating Parameters}
+alpha <- 2.5
+
+betas <- clip(rnorm((Z_dim*(U_dim^2)/2),-1,0.5),0.01,20)
+betas <- c(betas,betas)
+betas <- rep(0.2,Z_dim*(U_dim^2))
+betas <- array(betas,dim=c(Z_dim,U_dim,U_dim))
+betas <- aperm(betas,c(3,2,1))
+
+deltas <- delta_sim(U_dim,Z_dim)
+deltas <- array(rep(0.25,8),dim = c(2,4))
+gammas <- gamma_calc(phis_m,omegas)
+```
+
+```{r Match Lengths}
+Real_Lengths <- function(){
+  game_lengths <- lapply(games_list_2022,function(df) length(df$game_id))
+  quarter_games <- lapply(game_lengths, function(val){ 
+    mid <- val %/% 2 
+    first <- mid %/%2
+    third <- ((val-mid)%/%2)
+    return( list(first,(mid-first),third,(val-third-mid)) )
+    })
+  quarter_lengths <- unlist(quarter_games)
+}
+
+quarter_lengths <- rep(100,(num_games*4))
+```
+
+```{r Gameweeks}
+library(gtools)
+library(dplyr)
+
+#East Conference
+Atlantic <- list(2,18,20,17,28)
+Central <- list(5,11,15,8,4)
+Southeast <- list(19,14,1,30,27)
+#West Conference
+Northwest <- list(25,7,16,22,26)
+Pacific <- list(13,12,9,23,21)
+Southwest <- list(29,10,6,24,3)
+
+#Full
+teams <- c(1:num_teams)
+
+gameweek_maker <- function(perms,n){
+  #Creates list of lists for gameweeks:
+  gw_list = list()
+  for(j in 1:n){
+    gw_list[[paste0("g_", j)]] <- list()
+  }
+  perm_rep <- perms
+  #Looping For Gameweek:
+  for(i in 1:n){
+    #If df empty, fill it again:
+    if(dim(perm_rep)[1] == 0){
+      perm_rep <- perms
+    }
+    #Setting df for iteration:
+    perm_temp <- perm_rep
+    available <- c(1:num_teams)
+    gw <- list()
+    while(length(available) > 0){
+      match <- sample_n(perm_temp,1, replace = FALSE)
+      match_vec <- as.vector(match)
+      t1 <- match_vec[1]
+      t2 <- match_vec[2]
+      unavailable <- which(perm_temp$V1 == t1 | perm_temp$V1==t2 | perm_temp$V2==t1 | perm_temp$V2==t2)
+      #Removing Rows containing either team just sampled
+      perm_temp <- perm_temp[-unavailable,]
+      #Adding match to this Game week
+      gw <- rbind(gw, match)
+      available <- available[available != t1]
+      available <- available[available != t2]
+    }
+    gw_list[[i]] <- gw
+  }
+  return(gw_list)
+}
+
+count <- 0
+perm <- as.data.frame(permutations(n = num_teams, r = 2, v = teams))
+#Each Row Is A Game
+simulated_gameweeks <- gameweek_maker(perm,n_gw)
+```
+
+```{r Gaussian Mixture Sample}
+GaussMix <- function(weights,mus,sigmas){
+  which_dist <- sample(1:2,size=1,replace=TRUE,prob = weights)
+  m <- as.numeric(mus[which_dist])
+  var <- as.numeric(sigmas[which_dist])
+  sample <- rnorm(1,mean=m,sd=var)
+  exp_samp <- exp(sample)
+  return(exp_samp)
+}
+```
+
+```{r Sim Set-Up}
+library(RcppCNPy)
+library(mixtools)
+
+weights_opt <- clip(rnorm(U_dim,0.5,0.2),0,1)
+weights_opt <- data.frame(first = weights_opt,second=(1-weights_opt))#npyLoad("weights_opt.npy")
+#mean_vec_opt <- clip(rnorm(U_dim*2,15,5),0,50)#npyLoad("mean_vec_opt.npy")
+means_opt <- data.frame(matrix(runif(U_dim*2,0.5,0.7),nrow=U_dim))#npyLoad("means_opt.npy")
+variances_opt <- data.frame(matrix(runif(U_dim*2,0,0.4),nrow=U_dim)) #npyLoad("variances_opt.npy")
+```
+
+```{r Simulating}
+sim_times <- list()
+sim_marks <- list()
+sim_teams <- list()
+sim_zones <- list()
+
+marks <- c(0:(U_dim-1))
+teams <- c(0:(num_teams-1))
+
+#Defining For Jumpballs:
+#start_1=6
+#start_2=30
+
+#For Small Sim:
+start_1 = 0
+start_2 = (U_dim/2)
+
+#Simulating:
+g_week <- 1
+for(i in 1:num_games){
+  match <- i%%(num_teams/2)
+  if(match==0){
+    match <- (num_teams/2)
+  }
+  #print(match)
+  h_team <- simulated_gameweeks[[g_week]][match,1]
+  a_team <- simulated_gameweeks[[g_week]][match,2]
+  for(q in 1:4){
+    sim_times[[(4*(i-1)+q)]] <- list()
+    sim_marks[[(4*(i-1)+q)]] <- list()
+    sim_teams[[(4*(i-1)+q)]] <- list()
+    sim_zones[[(4*(i-1)+q)]] <- list()
+    q_length <- quarter_lengths[[(4*(i-1)+q)]]
+    #Extracting Home And Away Team
+    #Setting Up Start Of Lists
+    sim_marks[[(4*(i-1)+q)]][[1]] <- sample(c(start_1, start_2),size = 1)
+    sim_times[[(4*(i-1)+q)]][[1]] <- 0
+    sim_zones[[(4*(i-1)+q)]][[1]] <- 1
+    if(sim_marks[[(4*(i-1)+q)]][[1]]==start_1){
+      sim_teams[[(4*(i-1)+q)]][[1]] <- a_team
+    }
+    else{
+      sim_teams[[(4*(i-1)+q)]][[1]] <- h_team
+    }
+    #Now we will simulate the rest of the game
+    for(j in 2:(q_length)){
+      #print(j)
+      prev <- j-1
+      #Sample Time Based On Previous Mark:
+      u <- sim_marks[[(4*(i-1)+q)]][[prev]]+1
+      t_means <- means_opt[u,] 
+      t_var <- variances_opt[u,]
+      t_weights <- weights_opt[u,]
+      inter_arrival <- GaussMix(t_weights,t_means,t_var) #Function Defined Above
+      #Need To Find Event Time:
+      time <- sim_times[[(4*(i-1)+q)]][[prev]] + inter_arrival
+      sim_times[[(4*(i-1)+q)]][[j]] <- time
+      if(j<10000000000){
+        times_q <- unlist(sim_times[[(4*(i-1)+q)]][1:j])
+        marks_q <- unlist(sim_marks[[(4*(i-1)+q)]][1:prev])
+        teams_q <- unlist(sim_teams[[(4*(i-1)+q)]][1:prev])
+        zones_q <- unlist(sim_zones[[(4*(i-1)+q)]][1:prev])
+      }
+      #else{
+        #times_q <- unlist(sim_times[[(4*(i-1)+q)]][(j-5):j])
+        #marks_q <- unlist(sim_marks[[(4*(i-1)+q)]][(j-5):prev])
+        #teams_q <- unlist(sim_teams[[(4*(i-1)+q)]][(j-5):prev])
+        #zones_q <- unlist(sim_zones[[(4*(i-1)+q)]][(j-5):prev])
+      #}
+      marks_q <- marks_q+1
+      #Defining parameters for pmf function:
+      team_prev <- sim_teams[[(4*(i-1)+q)]][[prev]]
+      z_pred <- sample(c(1,2),size=1,prob=c(0.6,0.4))
+      #z_delta <- t(deltas)[,z_pred]
+      #z_beta <- betas[,,z_pred]
+      #z_gamma_a <- gammas[,1:(U_dim/2),z_pred,a_team,g_week]
+      #z_gamma_h <- gammas[,((U_dim/2)+1):U_dim,z_pred,h_team,g_week]
+      #z_gamma <- cbind(z_gamma_a,z_gamma_h)
+      gw_gamma <- gammas[,,,,g_week]
+      #Finding pmf:
+      prob_vec <- DPP_PMF(deltas,gw_gamma,betas,times_q,marks_q,alpha,teams_q,U_dim,z_pred,zones_q, h_team,a_team)
+      #if(i==1){
+        #print(length(prob_vec))
+        #print(prob_vec)
+        #print(sum(prob_vec))
+      #}
+      #prob_vec <- prob_vec/sum(prob_vec) #should already be normalised
+      next_mark <- sample(1:U_dim, size=1, replace=TRUE,prob = prob_vec)
+      #next_mark <- which.max(prob_vec)
+      #Assigning Mark, time and team
+      sim_zones[[(4*(i-1)+q)]][[j]] <- z_pred
+      sim_marks[[(4*(i-1)+q)]][[j]] <- (next_mark-1)
+      if(next_mark>(U_dim/2)){
+        sim_teams[[(4*(i-1)+q)]][[j]] <- h_team
+      }
+      else{
+        sim_teams[[(4*(i-1)+q)]][[j]] <- a_team
+      }
+    }
+    if(match==num_teams/2 & q==4){
+      g_week <- g_week+1
+      print('Next Gameweek')
+      print(g_week)
+    }
+  }
+}
+print('Done')
+
+```
+
+```{r Writing Lists To Drive}
+library(jsonlite)
+
+sim_times <- lapply(sim_times, function(x) unlist(x))
+sim_marks <- lapply(sim_marks, function(x) unlist(x))
+sim_teams <- lapply(sim_teams, function(x) unlist(x))
+sim_teams <- lapply(sim_teams, function(x) x - 1)
+sim_zones <- lapply(sim_zones, function(x) unlist(x))
+sim_zones <- lapply(sim_zones, function(x) x - 1)
+
+write_json(sim_times, "C:/Users/joshh/GitFolder/NBAScalableMPP/sim_times_2.json")
+write_json(sim_marks, "C:/Users/joshh/GitFolder/NBAScalableMPP/sim_marks_2.json")
+write_json(sim_teams, "C:/Users/joshh/GitFolder/NBAScalableMPP/sim_teams_2.json")
+write_json(sim_zones, "C:/Users/joshh/GitFolder/NBAScalableMPP/sim_zones_2.json")
+
+```
+
+```{r Model x0}
+#Model Data
+model_x0 <- npyLoad("simx0_new.npy")
+omegas_all_ind = rho_ind + (U_dim-1) * 4 * 19
+#Sim Omegas
+omega_start <-rho_ind
+omega_sim_size <- ((U_dim-1)*num_teams*n_gw_train)
+omega_model <- model_x0[c((omega_start+1):omegas_all_ind)]
+omegas_model <- array(omega_model,dim=c(n_gw_train,(U_dim-1),num_teams))
+omegas_model <- aperm(omegas_model, c(2, 1, 3))
+
+#Phis
+phis_model <- array(model_x0[c((m_phis_ind+1):sigma_phis_ind)],dim=c((U_dim-1),U_dim,2))
+phis_model <- aperm(phis_model, c(2, 1, 3))
+
+#Gammas
+gammas_model <- c(gamma_calc(phis_model,omegas_model))
+gammas_2comp <- c(gammas[,,,,1:n_gw_train])
+gamma_comparison <- data.frame(Actual=gammas_2comp, Model = gammas_model)
+```
+
+```{r Omega Comparison}
+u=3
+t=2
+
+test_omega <- omegas[u,1:n_gw_train,t]
+comp_omega <- omegas_model[u,1:n_gw_train,t]
+
+omega_data <- data.frame(
+  date = rep(c(1:n_gw_train),times=2),  
+  omega = c(test_omega,comp_omega), 
+  SorM = rep(c('Simulated','Model'), each=n_gw_train),
+  col = rep(c('Sim','Mod'), each=n_gw_train)
+)
+
+ts_plot <- ggplot(omega_data, aes(x=date, y=omega, color = col,group= SorM)) + 
+  geom_line() + labs(title = "Time Series For Comparing Omegas", x="Gameweek", y="Omega") + theme_minimal() + geom_line(size = 1)
+
+print(ts_plot)
+
+```
+
+```{r Baseline Comparisons}
+#Set team 1 as baseline
+baseline <- omegas[,1:n_gw_train,1]
+omega_adj <- array(rep(0,(U_dim-1)*n_gw_train*num_teams),dim=c((U_dim-1),n_gw_train,num_teams))
+for(i in 1:num_teams){
+  omega_adj[,,i] <- omegas[,1:n_gw_train,i] - baseline
+}
+
+mod_baseline <- omegas_model[,1:n_gw_train,1]
+mod_omega_adj <- array(rep(0,(U_dim-1)*n_gw_train*num_teams),dim=c((U_dim-1),n_gw_train,num_teams))
+for(i in 1:num_teams){
+  mod_omega_adj[,,i] <- omegas_model[,1:n_gw_train,i]-mod_baseline
+}
+```
+
+```{r Omega Plots}
+omega_tsplot <- function(omegas,n_gw,n_teams,u){
+  teams <- c(1:n_teams)
+  mark_array <- omegas[u,(1:n_gw),]
+  mark_vec <- c(mark_array)
+  
+  sim_time_data <- data.frame(
+    date = rep(c(1:n_gw),times=n_teams),  
+    ability = mark_vec,
+    team = rep(teams, each = n_gw)
+  )
+  
+  omega_plot <- ggplot(sim_time_data, aes(x=date, y=ability, group=factor(team), color=factor(team))) + geom_line(size = 1) + labs(title = paste("Time Series Plot For Ability In Mark",u,sep = " : "), x="Gameweek", y="Omega") + theme_minimal()
+  
+  return(omega_plot)
+}
+
+print(omega_tsplot(omega_adj,n_gw_train,num_teams,1))
+print(omega_tsplot(mod_omega_adj,n_gw_train,num_teams,1))
+
+print(omega_tsplot(omega_adj,n_gw_train,num_teams,2))
+print(omega_tsplot(mod_omega_adj,n_gw_train,num_teams,2))
+
+print(omega_tsplot(omega_adj,n_gw_train,num_teams,3))
+print(omega_tsplot(mod_omega_adj,n_gw_train,num_teams,3))
+
+```
